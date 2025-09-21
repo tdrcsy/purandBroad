@@ -2,7 +2,7 @@
 set -e
 
 # ============================
-# 配置区（可修改）
+# 用户自定义变量
 # ============================
 CONTAINER_NAME="KalDev"
 PASSWORD="Kal1349.."
@@ -11,39 +11,24 @@ PROJECT_DIR="/home/kal/dev"
 CONFIG_DIR="/home/kal/dev-config"
 CUSTOM_WELCOME="Welcome back Kal, this is your DevSpace, please enter your PASSWORD below to log in."
 DOMAIN_NAME="dev.930009.xyz"
+CODE_SERVER_IMAGE="codercom/code-server:latest"
 TUNNEL_NAME="KalDevTunnel"
 
-CODE_SERVER_IMAGE="codercom/code-server:latest"
-CLOUDFLARED_SERVICE="/etc/systemd/system/cloudflared.service"
-
 # ============================
-# 检查依赖
+# 1. 系统检查与目录初始化
 # ============================
 echo "[INFO] 检查系统依赖..."
 for cmd in docker cloudflared lsof; do
-    if ! command -v $cmd >/dev/null 2>&1; then
-        echo "[ERROR] 未找到 $cmd，请先安装"
-        exit 1
-    fi
+    command -v $cmd >/dev/null 2>&1 || { echo "[ERROR] $cmd 未安装"; exit 1; }
 done
 
-# ============================
-# 创建目录 + 权限
-# ============================
 echo "[INFO] 创建并设置项目/配置目录..."
 mkdir -p "$PROJECT_DIR" "$CONFIG_DIR"
+chmod -R 755 "$PROJECT_DIR" "$CONFIG_DIR"
 chown -R 1000:1000 "$PROJECT_DIR" "$CONFIG_DIR"
 
 # ============================
-# 检查磁盘空间
-# ============================
-AVAILABLE=$(df "$PROJECT_DIR" | tail -1 | awk '{print $4}')
-if [ "$AVAILABLE" -lt 1048576 ]; then
-    echo "[WARN] 磁盘剩余空间 < 1GB，可能导致失败"
-fi
-
-# ============================
-# 端口检测与释放
+# 2. 端口检测与释放
 # ============================
 check_port() {
     local port=$1
@@ -52,39 +37,57 @@ check_port() {
         OCCUPIED=$(lsof -i:$port -t || true)
         if [ -z "$OCCUPIED" ]; then
             echo $port
-            return
+            return 0
         fi
-        # 检查是否 Docker 容器占用
         DOCKER_CONTAINER=$(docker ps --filter "publish=$port" --format "{{.Names}}")
         if [ -n "$DOCKER_CONTAINER" ]; then
-            echo "[INFO] 端口 $port 被容器 $DOCKER_CONTAINER 占用，正在停止并删除..."
-            docker stop $DOCKER_CONTAINER >/dev/null 2>&1 || true
-            docker rm $DOCKER_CONTAINER >/dev/null 2>&1 || true
+            echo "[INFO] 停止并删除占用端口 $port 的 Docker 容器 $DOCKER_CONTAINER ..."
+            docker stop $DOCKER_CONTAINER
+            docker rm $DOCKER_CONTAINER
+            echo "[INFO] 端口 $port 已释放"
             echo $port
-            return
+            return 0
         fi
+        echo "[WARN] 端口 $port 被非 Docker 进程占用，尝试下一个端口"
         port=$((port+1))
     done
-    echo "[ERROR] 未找到可用端口"
+    echo "[ERROR] 没有可用端口" >&2
     exit 1
 }
+
 HOST_PORT=$(check_port $DEFAULT_PORT)
-echo "[INFO] 使用端口: $HOST_PORT"
+echo "[INFO] 使用端口 $HOST_PORT"
 
 # ============================
-# 停止旧容器
+# 3. 停止并删除旧容器
 # ============================
-if docker ps -a --format "{{.Names}}" | grep -q "^$CONTAINER_NAME$"; then
-    echo "[INFO] 删除已有容器 $CONTAINER_NAME ..."
-    docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
+EXISTING_CONTAINER=$(docker ps -a -q -f name=$CONTAINER_NAME)
+if [ -n "$EXISTING_CONTAINER" ]; then
+    echo "[INFO] 停止并删除已有容器 $CONTAINER_NAME ..."
+    docker stop $CONTAINER_NAME
+    docker rm $CONTAINER_NAME
 fi
 
 # ============================
-# 拉取镜像并启动容器
+# 4. 初始化配置目录
 # ============================
-echo "[INFO] 拉取最新镜像..."
+if [ ! -d "$CONFIG_DIR/share/code-server/extensions" ]; then
+    echo "[INFO] 初始化配置目录 $CONFIG_DIR ..."
+    mkdir -p "$CONFIG_DIR/share/code-server/extensions"
+    touch "$CONFIG_DIR/share/code-server/extensions/extensions.json"
+fi
+chmod -R 755 "$CONFIG_DIR"
+chown -R 1000:1000 "$CONFIG_DIR"
+
+# ============================
+# 5. 拉取最新 code-server 镜像
+# ============================
+echo "[INFO] 拉取最新 code-server 镜像..."
 docker pull $CODE_SERVER_IMAGE
 
+# ============================
+# 6. 启动 code-server 容器
+# ============================
 echo "[INFO] 启动容器 $CONTAINER_NAME ..."
 docker run -d \
   --name $CONTAINER_NAME \
@@ -97,21 +100,20 @@ docker run -d \
   $CODE_SERVER_IMAGE
 
 # ============================
-# 配置 Cloudflare Tunnel
+# 7. 自动识别最新 Cloudflared Tunnel JSON
 # ============================
-TUNNEL_ID_FILE="/root/.cloudflared/${TUNNEL_NAME}.json"
-if [ ! -f "$TUNNEL_ID_FILE" ]; then
-    echo "[INFO] 创建 Cloudflare Tunnel $TUNNEL_NAME ..."
-    cloudflared tunnel create $TUNNEL_NAME
-    TUNNEL_ID_FILE=$(ls /root/.cloudflared/*.json | grep $TUNNEL_NAME | head -n 1)
+TUNNEL_ID_FILE=$(ls /root/.cloudflared/*.json | grep "$TUNNEL_NAME" | head -n 1 || true)
+if [ -z "$TUNNEL_ID_FILE" ]; then
+    echo "[ERROR] Cloudflared 隧道凭证文件不存在: $TUNNEL_NAME"
+    echo "请先执行: cloudflared tunnel create $TUNNEL_NAME"
+    exit 1
 fi
-TUNNEL_ID=$(basename "$TUNNEL_ID_FILE" .json)
 
 CONFIG_FILE="/etc/cloudflared/config.yml"
-echo "[INFO] 生成 Cloudflare 配置文件..."
-mkdir -p /etc/cloudflared
-cat > $CONFIG_FILE <<EOF
-tunnel: $TUNNEL_ID
+
+echo "[INFO] 更新 Cloudflare Tunnel 配置..."
+sudo bash -c "cat > $CONFIG_FILE" <<EOF
+tunnel: $(basename $TUNNEL_ID_FILE .json)
 credentials-file: $TUNNEL_ID_FILE
 
 ingress:
@@ -121,40 +123,21 @@ ingress:
 EOF
 
 # ============================
-# 配置 systemd 自启动
+# 8. 重启 Cloudflare Tunnel
 # ============================
-if [ ! -f "$CLOUDFLARED_SERVICE" ]; then
-    echo "[INFO] 配置 cloudflared systemd 服务..."
-    cat > $CLOUDFLARED_SERVICE <<EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-
-[Service]
-TimeoutStartSec=0
-Type=notify
-ExecStart=/usr/bin/cloudflared --config $CONFIG_FILE --no-autoupdate tunnel run
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reexec
-    systemctl enable cloudflared
-fi
-
-echo "[INFO] 重启 cloudflared ..."
-systemctl restart cloudflared
+echo "[INFO] 重启 cloudflared 隧道服务..."
+sudo systemctl restart cloudflared
+sudo systemctl enable cloudflared
 
 # ============================
-# 输出结果
+# 9. 输出信息
 # ============================
-echo "====================================================="
-echo " ✅ DevSpace 部署完成!"
-echo " 容器名称: $CONTAINER_NAME"
-echo " 项目目录: $PROJECT_DIR"
-echo " 配置目录: $CONFIG_DIR"
-echo " 访问地址: https://$DOMAIN_NAME"
-echo " 宿主机端口: $HOST_PORT"
-echo "====================================================="
+echo "========================================="
+echo "✅ code-server 部署/升级完成!"
+echo "容器名称: $CONTAINER_NAME"
+echo "项目目录: $PROJECT_DIR"
+echo "配置目录: $CONFIG_DIR"
+echo "访问地址: https://$DOMAIN_NAME"
+echo "宿主机端口: $HOST_PORT"
+echo "欢迎信息: $CUSTOM_WELCOME"
+echo "========================================="
