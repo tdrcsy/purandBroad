@@ -12,41 +12,41 @@ CONFIG_DIR="/home/kal/dev-config"
 CUSTOM_WELCOME="Welcome back Kal, this is your DevSpace, please enter your PASSWORD below to log in."
 DOMAIN_NAME="dev.930009.xyz"
 
-# 这里填你实际的隧道凭证路径
-TUNNEL_NAME="KalDevTunnel"
-TUNNEL_CREDENTIALS="/root/.cloudflared/69c0f02a-f5af-4498-b85d-b9becb0d915e.json"
 CONFIG_FILE="/etc/cloudflared/config.yml"
-
 CODE_SERVER_IMAGE="codercom/code-server:latest"
 
 # ============================
-# 1. 系统检查与目录初始化
+# 1. 系统检查
 # ============================
 echo "[INFO] 检查系统依赖..."
 for cmd in docker cloudflared lsof; do
-    command -v $cmd >/dev/null 2>&1 || { echo "[ERROR] $cmd 未安装"; exit 1; }
+    if ! command -v $cmd >/dev/null 2>&1; then
+        echo "[ERROR] $cmd 未安装"
+        exit 1
+    fi
 done
 
+# ============================
+# 2. 创建目录并处理权限
+# ============================
 echo "[INFO] 创建并设置项目/配置目录..."
-mkdir -p "$PROJECT_DIR" "$CONFIG_DIR"
-chmod -R 755 "$PROJECT_DIR" "$CONFIG_DIR"
+mkdir -p "$PROJECT_DIR" "$CONFIG_DIR/share/code-server/extensions"
+touch "$CONFIG_DIR/share/code-server/extensions/extensions.json"
 chown -R 1000:1000 "$PROJECT_DIR" "$CONFIG_DIR"
+chmod -R 755 "$PROJECT_DIR" "$CONFIG_DIR"
 
 # ============================
-# 2. 端口检测函数
+# 3. 检查可用端口
 # ============================
 check_port() {
     local port=$1
     local max_port=$((port+100))
     while [ $port -le $max_port ]; do
-        # 检查端口是否被占用
         OCCUPIED=$(lsof -i:$port -t || true)
         if [ -z "$OCCUPIED" ]; then
             echo $port
-            return 0
+            return
         fi
-
-        # 检查是否是 Docker 容器占用
         DOCKER_CONTAINER=$(docker ps --filter "publish=$port" --format "{{.Names}}")
         if [ -n "$DOCKER_CONTAINER" ]; then
             echo "[INFO] 停止并删除占用端口 $port 的 Docker 容器 $DOCKER_CONTAINER ..."
@@ -54,9 +54,8 @@ check_port() {
             docker rm $DOCKER_CONTAINER
             echo "[INFO] 端口 $port 已释放"
             echo $port
-            return 0
+            return
         fi
-
         echo "[WARN] 端口 $port 被非 Docker 进程占用，尝试下一个端口"
         port=$((port+1))
     done
@@ -68,22 +67,13 @@ HOST_PORT=$(check_port $DEFAULT_PORT)
 echo "[INFO] 使用端口 $HOST_PORT"
 
 # ============================
-# 3. 停止并删除旧容器
+# 4. 停止并删除旧容器
 # ============================
 EXISTING_CONTAINER=$(docker ps -a -q -f name=$CONTAINER_NAME)
 if [ -n "$EXISTING_CONTAINER" ]; then
     echo "[INFO] 停止并删除已有容器 $CONTAINER_NAME ..."
     docker stop $CONTAINER_NAME
     docker rm $CONTAINER_NAME
-fi
-
-# ============================
-# 4. 初始化 code-server 配置目录
-# ============================
-if [ ! -d "$CONFIG_DIR/share/code-server/extensions" ]; then
-    echo "[INFO] 初始化配置目录 $CONFIG_DIR ..."
-    mkdir -p "$CONFIG_DIR/share/code-server/extensions"
-    touch "$CONFIG_DIR/share/code-server/extensions/extensions.json"
 fi
 
 # ============================
@@ -107,13 +97,20 @@ docker run -d \
   $CODE_SERVER_IMAGE
 
 # ============================
-# 7. 更新 Cloudflare Tunnel 配置
+# 7. 自动检测 Cloudflare 隧道凭证
 # ============================
-if [ ! -f "$TUNNEL_CREDENTIALS" ]; then
-    echo "[ERROR] Cloudflared 隧道凭证文件不存在: $TUNNEL_CREDENTIALS"
-    echo "请先执行: cloudflared tunnel create $TUNNEL_NAME"
+CREDENTIALS_JSON=$(ls /root/.cloudflared/*.json 2>/dev/null | head -n1)
+
+if [ -z "$CREDENTIALS_JSON" ]; then
+    echo "[ERROR] 未找到 Cloudflared 隧道凭证文件"
+    echo "请先执行: cloudflared tunnel create <name>"
     exit 1
 fi
+
+TUNNEL_NAME=$(basename "$CREDENTIALS_JSON" .json)
+TUNNEL_CREDENTIALS="$CREDENTIALS_JSON"
+
+echo "[INFO] 使用隧道: $TUNNEL_NAME ($TUNNEL_CREDENTIALS)"
 
 echo "[INFO] 更新 Cloudflare Tunnel 配置..."
 sudo bash -c "cat > $CONFIG_FILE" <<EOF
@@ -144,5 +141,6 @@ echo "配置目录: $CONFIG_DIR"
 echo "访问地址: https://$DOMAIN_NAME"
 echo "宿主机端口: $HOST_PORT"
 echo "欢迎信息: $CUSTOM_WELCOME"
-echo "Cloudflared 隧道凭证: $TUNNEL_CREDENTIALS"
+echo "隧道名称: $TUNNEL_NAME"
+echo "隧道凭证: $TUNNEL_CREDENTIALS"
 echo "========================================="
