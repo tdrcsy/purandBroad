@@ -26,7 +26,6 @@ read -p "输入 Cloudflare 隧道名称 (默认 KalDevTunnel): " TUNNEL_NAME
 TUNNEL_NAME=${TUNNEL_NAME:-KalDevTunnel}
 
 CUSTOM_WELCOME="Welcome back, this is your DevSpace, please enter your PASSWORD below to log in."
-
 CODE_SERVER_IMAGE="codercom/code-server:latest"
 
 # ============================
